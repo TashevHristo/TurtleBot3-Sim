@@ -46,7 +46,9 @@ A run writes these files:
 - failures;
 - steps in which the camera saw an obstacle closer than the lidar did.
 
-The first run downloads the TurtleBot3 asset from Isaac Sim's asset server. You need an RTX-capable GPU and FFmpeg for the MP4.
+The first run downloads the TurtleBot3 asset from Isaac Sim's asset server.
+
+**Startup time.** The shared Isaac Sim install folder is read-only for students, so Isaac Sim can't save its compiled shaders there and would recompile them on every launch, which takes about 80 s. The demo therefore keeps Isaac Sim's cache in `~/.cache/isaac-sim-turtlebot3`, about 0.9 GB; set `TURTLEBOT3_KIT_CACHE` to use another folder. The first launch takes about 95 s while the cache fills, and later launches start in about 8–10 s. If startup becomes slow again, for example after a GPU driver update, the cache is being rebuilt, and only that one launch is slow. Each launch prints `[startup]` lines showing how long each stage took. You need an RTX-capable GPU and FFmpeg for the MP4.
 
 ### Options
 
@@ -79,6 +81,11 @@ While the simulation runs, the dashboard shows:
 - the goal distance and heading error;
 - the lidar and camera clearances;
 - the current navigation mode, e.g. `boundary following: wall on right`.
+- a small **Robot camera** inset in the corner of the video, showing the robot's own front camera;
+- a **Sensors** row under the video:
+  - a top-down view of the lidar hits (blue) and depth-camera detections (orange), with the direction to the goal and the chosen heading;
+  - the colour-coded depth image (red is near, blue is far; obstacles are bright and the floor is dimmed);
+  - live readings: lidar hits, the closest obstacle seen by each sensor, the free distance ahead, and the speed and turn commands.
 
 **Pause**, **Resume** and **Stop** control the run. After the robot reaches the goal, the last frame stays on screen until you press **Stop**.
 

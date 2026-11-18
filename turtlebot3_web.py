@@ -29,6 +29,20 @@ gap:16px;padding:16px;max-width:1500px;margin:auto}
 overflow:hidden;min-height:240px;aspect-ratio:16/9;display:grid;place-items:center}
 .screen img{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}
 .placeholder{color:var(--muted);padding:24px;text-align:center}
+.pip{position:absolute;right:10px;bottom:10px;width:min(28%,260px);aspect-ratio:4/3;z-index:2;
+border:1px solid #ffffff55;border-radius:6px;overflow:hidden;background:#000;box-shadow:0 2px 10px #0009}
+.pip img{position:static;width:100%;height:100%;object-fit:cover;display:block}
+.pip span{position:absolute;top:5px;left:6px;padding:1px 6px;border-radius:4px;background:#080b0dcc;
+color:#e5e9ef;font:11px ui-monospace,monospace}
+@media(max-width:500px){.pip{width:38%}}
+.sensors{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:12px}
+.sensors section{min-width:0}.radar{width:100%;aspect-ratio:1;display:block;background:#0b0f13;border-radius:6px}
+.depth{width:100%;aspect-ratio:4/3;display:block;background:#000;border-radius:6px;object-fit:cover}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;color:var(--muted);font-size:12px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+.ramp{height:8px;border-radius:4px;margin-top:8px;background:linear-gradient(90deg,#eb3c28,#fadc3c,#28c8c8,#1e5ac8,#0a143c)}
+.ramp-labels{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:3px}
+.empty{color:var(--muted);font-size:12px;margin:6px 0 0}
 .caption{position:absolute;bottom:10px;left:10px;padding:4px 9px;border-radius:5px;
 background:#080b0dcc;color:#e5e9ef;font:12px ui-monospace,monospace}
 aside{display:flex;flex-direction:column;gap:12px}section{background:var(--panel);
@@ -54,7 +68,21 @@ dt{color:var(--muted)}dd{margin:0;text-align:right;font-variant-numeric:tabular-
 <img id="stream" alt="Live simulation camera">
 <div class="placeholder" id="placeholder">Waiting for the first camera frame…</div>
 <div class="caption" id="caption">Simulation starting</div>
-</div><p class="hint">Live camera and navigation telemetry update as the simulation runs.</p></div>
+<div class="pip" id="pip" hidden><img id="onboard" alt="Robot front camera"><span>Robot camera</span></div>
+</div><p class="hint">Live camera and navigation telemetry update as the simulation runs.</p>
+<div class="sensors">
+<section><h2>Range sensors · top view</h2><canvas id="radar" class="radar" width="520" height="520"></canvas>
+<div class="legend"><span><i style="background:#5295ef"></i>Lidar</span><span><i style="background:#f2a541"></i>Depth camera</span><span><i style="background:#56c99a"></i>Goal direction</span><span><i style="background:#e8edf3"></i>Chosen heading</span></div></section>
+<section><h2>Depth camera</h2><img id="depth" class="depth" alt="Depth image from the robot camera" hidden>
+<p class="empty" id="depth-empty">No depth image yet.</p>
+<div class="ramp"></div><div class="ramp-labels"><span>near</span><span>1.5 m</span><span>3 m+</span></div><p class="empty">Bright: obstacle. Dim: floor.</p></section>
+<section><h2>Sensor readings</h2><dl>
+<dt>Lidar hits</dt><dd id="s-lidar">—</dd><dt>Closest (lidar)</dt><dd id="s-lidar-near">—</dd>
+<dt>Camera detections</dt><dd id="s-camera">—</dd><dt>Closest (camera)</dt><dd id="s-camera-near">—</dd>
+<dt>Depth frames</dt><dd id="s-frames">—</dd><dt>Free distance ahead</dt><dd id="s-clear">—</dd>
+<dt>Speed command</dt><dd id="s-linear">—</dd><dt>Turn command</dt><dd id="s-angular">—</dd>
+</dl></section>
+</div></div>
 <aside><section><h2>Simulation</h2><div class="controls">
 <button id="start" class="primary">Start simulation</button>
 <button id="pause" class="primary" hidden>Pause</button><button id="resume" hidden>Resume</button>
@@ -69,10 +97,14 @@ dt{color:var(--muted)}dd{margin:0;text-align:right;font-variant-numeric:tabular-
 </dl></section></aside></main>
 <script>
 const $=id=>document.getElementById(id);
-let stopped=false,streamConnected=false,streamWanted=false,lastStatus="",runEnded=false,shutDown=false;
+let onboardConnected=false,stopped=false,streamConnected=false,streamWanted=false,lastStatus="",runEnded=false,shutDown=false;
 const FIELDS=["mode","step","position","goal","distance","heading","front","left","right","nearest"];
 function resetRun(){
   streamConnected=false;$("stream").removeAttribute("src");
+  onboardConnected=false;$("onboard").removeAttribute("src");$("pip").hidden=true;
+  depthConnected=false;$("depth").removeAttribute("src");$("depth").hidden=true;$("depth-empty").hidden=false;
+  for(const id of ["s-lidar","s-lidar-near","s-camera","s-camera-near","s-frames","s-clear","s-linear","s-angular"])setText(id,"\u2014");
+  drawRadar(null);
   $("placeholder").hidden=false;setText("placeholder","Click Start simulation to begin a run.");
   for(const id of FIELDS)setText(id,"\u2014");
 }
@@ -81,6 +113,54 @@ function setText(id,value){$(id).textContent=value}
 function connectStream(){
   if(streamConnected||!streamWanted)return;
   streamConnected=true;$("stream").src="/stream.mjpg?ts="+Date.now();
+}
+let depthConnected=false,sensorBusy=false;
+function connectDepth(){
+  if(depthConnected||!streamWanted)return;
+  depthConnected=true;$("depth").src="/depth.mjpg?ts="+Date.now();
+}
+function drawRadar(d){
+  const c=$("radar"),g=c.getContext("2d"),W=c.width,H=c.height,cx=W/2,cy=H/2;
+  const R=(d&&d.range)||3.5,scale=(W/2-26)/R;
+  const P=(x,y)=>[cx-y*scale,cy-x*scale];   // robot frame: x forward (up), y left
+  g.clearRect(0,0,W,H);g.font="18px ui-monospace,monospace";g.textAlign="left";
+  g.strokeStyle="#303b48";g.fillStyle="#97a4b3";g.lineWidth=1.5;
+  for(let r=1;r<=Math.floor(R);r++){g.beginPath();g.arc(cx,cy,r*scale,0,2*Math.PI);g.stroke();
+    g.fillText(r+" m",cx+4,cy-r*scale+18)}
+  g.beginPath();g.moveTo(cx,cy-R*scale);g.lineTo(cx,cy+R*scale);g.moveTo(cx-R*scale,cy);g.lineTo(cx+R*scale,cy);g.stroke();
+  if(!d){g.fillText("Waiting for sensor data",cx-120,cy+60);return}
+  const ray=(angle,len,colour,width,dash)=>{if(angle==null)return;g.save();g.setLineDash(dash||[]);
+    g.strokeStyle=colour;g.lineWidth=width;g.beginPath();g.moveTo(cx,cy);
+    const [x,y]=P(len*Math.cos(angle),len*Math.sin(angle));g.lineTo(x,y);g.stroke();g.restore()};
+  ray(d.goal_bearing,Math.min(d.goal_distance,R),"#56c99a",3,[10,8]);
+  const dots=(pts,colour,size)=>{g.fillStyle=colour;for(const [x,y] of pts){const [px,py]=P(x,y);
+    g.fillRect(px-size/2,py-size/2,size,size)}};
+  dots(d.lidar,"#5295ef",6);dots(d.camera,"#f2a541",7);
+  if(d.heading!=null)ray(d.heading,Math.min(Math.max(d.clearance||0,0.3),R),"#e8edf3",3);
+  g.fillStyle="#1a2028";g.strokeStyle="#e8edf3";g.lineWidth=2;g.beginPath();g.arc(cx,cy,0.105*scale,0,2*Math.PI);g.fill();g.stroke();
+  g.beginPath();g.moveTo(cx,cy-0.105*scale-8);g.lineTo(cx-7,cy-0.105*scale+4);g.lineTo(cx+7,cy-0.105*scale+4);g.closePath();
+  g.fillStyle="#e8edf3";g.fill();
+}
+const m=v=>v==null?"none":Number(v).toFixed(2)+" m";
+async function refreshSensors(){
+  if(sensorBusy||!streamWanted)return;sensorBusy=true;
+  try{
+    const r=await fetch("/api/sensors",{cache:"no-store"});if(!r.ok)return;
+    const d=await r.json();if(!d||!d.lidar)return;
+    drawRadar(d);
+    setText("s-lidar",`${d.lidar.length} / ${d.lidar_rays} rays`);setText("s-lidar-near",m(d.lidar_nearest));
+    setText("s-camera",d.camera_enabled?`${d.camera.length} points`:"camera off");
+    setText("s-camera-near",d.camera_enabled?m(d.camera_nearest):"—");
+    setText("s-frames",d.camera_enabled?String(d.camera_frames):"—");
+    setText("s-clear",d.clearance==null?"—":m(d.clearance));
+    setText("s-linear",`${Number(d.linear).toFixed(2)} m/s`);
+    setText("s-angular",`${Number(d.angular).toFixed(2)} rad/s`);
+    if(d.camera_enabled)connectDepth();
+  }catch(e){}finally{sensorBusy=false}
+}
+function connectOnboard(){
+  if(onboardConnected||!streamWanted)return;
+  onboardConnected=true;$("onboard").src="/onboard.mjpg?ts="+Date.now();
 }
 async function send(action){
   try{
@@ -131,6 +211,7 @@ async function refresh(){
       if(t[key]!==undefined)setText(key,`${fmt(t[key])} m`);
     if(t.navigation)setText("mode",t.navigation);
     streamWanted=["running","completed"].includes(status);connectStream();
+    if(data.onboard_camera)connectOnboard();
     if(stopped&&!streamConnected)setText("placeholder","Simulation stopped");
   }catch(error){
     if(shutDown){$("dot").className="dot stopped";setText("status","Server shut down");
@@ -142,6 +223,12 @@ async function refresh(){
   }
 }
 $("stream").addEventListener("load",()=>{$("placeholder").hidden=true});
+$("onboard").addEventListener("load",()=>{$("pip").hidden=false});
+$("depth").addEventListener("load",()=>{$("depth").hidden=false;$("depth-empty").hidden=true});
+$("depth").addEventListener("error",()=>{depthConnected=false;if(!stopped)setTimeout(connectDepth,1500)});
+$("onboard").addEventListener("error",()=>{
+  onboardConnected=false;if(!stopped)setTimeout(connectOnboard,1500);
+});
 $("stream").addEventListener("error",()=>{
   streamConnected=false;
   if(!stopped){setText("placeholder","Reconnecting to camera…");setTimeout(connectStream,1200)}
@@ -153,7 +240,7 @@ $("shutdown").onclick=()=>{
   if(!confirm("Shut down the dashboard server? Any running simulation is stopped and the port is freed. You will need to start the server again from the terminal."))return;
   shutDown=true;runEnded=true;$("shutdown").disabled=true;send("shutdown");
 };
-window.addEventListener("load",()=>{refresh();setInterval(refresh,500)});
+window.addEventListener("load",()=>{drawRadar(null);refresh();setInterval(refresh,500);setInterval(refreshSensors,200)});
 </script></body></html>"""
 
 
@@ -164,6 +251,11 @@ class PreviewState:
         self._telemetry = {}
         self._jpeg = None
         self._sequence = 0
+        self._onboard_jpeg = None
+        self._onboard_sequence = 0
+        self._depth_jpeg = None
+        self._depth_sequence = 0
+        self._sensors = {}
         self._commands = queue.Queue()
         self._start_requested = False
         self._error = None
@@ -216,6 +308,28 @@ class PreviewState:
             self._sequence += 1
             self._condition.notify_all()
 
+    def publish_depth(self, jpeg):
+        """Colour-coded depth image from the robot camera."""
+        with self._condition:
+            self._depth_jpeg = jpeg
+            self._depth_sequence += 1
+            self._condition.notify_all()
+
+    def update_sensors(self, sensors):
+        with self._condition:
+            self._sensors = dict(sensors)
+
+    def sensors_snapshot(self):
+        with self._condition:
+            return dict(self._sensors)
+
+    def publish_onboard(self, jpeg):
+        """Frame from the robot's own front camera (shown as a small inset)."""
+        with self._condition:
+            self._onboard_jpeg = jpeg
+            self._onboard_sequence += 1
+            self._condition.notify_all()
+
     def snapshot(self):
         with self._condition:
             return {
@@ -223,6 +337,7 @@ class PreviewState:
                 "telemetry": dict(self._telemetry),
                 "error": self._error,
                 "shutdown": self._shutdown,
+                "onboard_camera": self._onboard_jpeg is not None,
             }
 
     def set_error(self, error):
@@ -231,13 +346,21 @@ class PreviewState:
             self._status = "failed"
             self._condition.notify_all()
 
-    def wait_for_next_frame(self, sequence):
+    def wait_for_next_frame(self, sequence, onboard=False, depth=False):
+        def latest():
+            if depth:
+                return self._depth_sequence, self._depth_jpeg
+            if onboard:
+                return self._onboard_sequence, self._onboard_jpeg
+            return self._sequence, self._jpeg
+
         with self._condition:
             self._condition.wait_for(
-                lambda: self._sequence > sequence or self._status == "stopped",
+                lambda: latest()[0] > sequence or self._status == "stopped",
                 timeout=15.0,
             )
-            return self._sequence, self._jpeg, self._status
+            current, jpeg = latest()
+            return current, jpeg, self._status
 
     def submit(self, action):
         self._commands.put(action)
@@ -266,6 +389,13 @@ class PreviewServer:
                     self._send(HTTPStatus.OK, body, "application/json")
                 elif path == "/stream.mjpg":
                     self._stream()
+                elif path == "/onboard.mjpg":
+                    self._stream(onboard=True)
+                elif path == "/depth.mjpg":
+                    self._stream(depth=True)
+                elif path == "/api/sensors":
+                    body = json.dumps(state.sensors_snapshot()).encode()
+                    self._send(HTTPStatus.OK, body, "application/json")
                 else:
                     self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain; charset=utf-8")
 
@@ -327,7 +457,7 @@ class PreviewServer:
                 state.submit(action)
                 self._send(HTTPStatus.ACCEPTED, b'{"accepted":true}', "application/json")
 
-            def _stream(self):
+            def _stream(self, onboard=False, depth=False):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-store")
@@ -336,7 +466,7 @@ class PreviewServer:
                 sequence = 0
                 try:
                     while True:
-                        sequence, jpeg, status = state.wait_for_next_frame(sequence)
+                        sequence, jpeg, status = state.wait_for_next_frame(sequence, onboard, depth)
                         if jpeg is not None:
                             self.wfile.write(
                                 b"--frame\r\nContent-Type: image/jpeg\r\n"

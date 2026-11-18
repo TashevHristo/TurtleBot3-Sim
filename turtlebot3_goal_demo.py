@@ -60,6 +60,16 @@ if args.http_stream_fps <= 0.0:
     raise SystemExit("--http-stream-fps must be > 0")
 output = resolve_output(args, "turtlebot3_goal")
 
+# Isaac Sim normally keeps its shader and data caches inside its own install
+# folder.  On this shared install that folder is read-only for students, so
+# nothing is cached and every launch recompiles all shaders (about 80 s).
+# Point Kit at a cache folder we own instead; only the first launch is slow.
+KIT_PORTABLE_ROOT = Path(os.environ.get(
+    "TURTLEBOT3_KIT_CACHE", Path.home() / ".cache" / "isaac-sim-turtlebot3"))
+if "--portable-root" not in sys.argv:
+    KIT_PORTABLE_ROOT.mkdir(parents=True, exist_ok=True)
+    sys.argv += ["--portable-root", str(KIT_PORTABLE_ROOT)]
+
 preview = PreviewServer(args.http_stream_port) if args.http_stream else None
 if preview is not None:
     preview.start()
@@ -172,6 +182,15 @@ try:
     def clamp(value, lower, upper):
         return max(lower, min(upper, value))
 
+    startup_clock = time.monotonic()
+
+    def startup_stage(name):
+        """Print how long each startup stage took (helps find slow starts)."""
+        global startup_clock
+        now = time.monotonic()
+        print(f"[startup] {name}: {now - startup_clock:.1f}s", flush=True)
+        startup_clock = now
+
     world = World(stage_units_in_meters=1.0, physics_dt=DT, rendering_dt=DT)
     world.scene.add_default_ground_plane()
     stage = omni.usd.get_context().get_stage()
@@ -199,12 +218,14 @@ try:
     make_marker(stage, "/World/Markers/Start", START, 0.20, (0.24, 0.67, 0.43))
     make_marker(stage, "/World/Markers/Goal", GOAL, 0.27, (0.15, 0.72, 0.73))
 
+    startup_stage("world and course built")
     assets_root = asyncio.get_event_loop().run_until_complete(
         get_assets_root_path_async()
     )
     if not assets_root:
         raise RuntimeError("Isaac Sim could not resolve its built-in asset root.")
     robot_usd = assets_root + "/Isaac/Robots/Turtlebot/Turtlebot3/turtlebot3_burger.usd"
+    startup_stage("asset server located")
     robot = WheeledRobot(
         "/World/TurtleBot3",
         wheel_dof_names=["wheel_left_joint", "wheel_right_joint"],
@@ -212,7 +233,9 @@ try:
         positions=[START[0], START[1], 0.12],
         orientations=[1.0, 0.0, 0.0, 0.0],
     )
+    startup_stage("robot model loaded")
     world.reset()
+    startup_stage("physics reset")
 
     scan_angles = np.linspace(-SCAN_FOV / 2.0, SCAN_FOV / 2.0, SCAN_RAY_COUNT)
     ray_directions = [
@@ -244,6 +267,7 @@ try:
         injected_low_obstacle = True
 
     camera_annotator = None
+    onboard_annotator = None
     if not args.no_camera:
         import omni.replicator.core as rep
 
@@ -266,12 +290,17 @@ try:
             CAMERA_PATH, (CAMERA_WIDTH, CAMERA_HEIGHT), name="FrontDepthCamera")
         camera_annotator = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
         camera_annotator.attach(camera_product)
+        if args.http_stream:
+            # Colour image from the same camera for the dashboard's inset view.
+            onboard_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+            onboard_annotator.attach(camera_product)
         focal_pixels = CAMERA_WIDTH * CAMERA_FOCAL_LENGTH / CAMERA_APERTURE
         pixel_u, pixel_v = np.meshgrid(np.arange(CAMERA_WIDTH) + 0.5,
                                        np.arange(CAMERA_HEIGHT) + 0.5)
         pixel_right = (pixel_u - CAMERA_WIDTH / 2.0) / focal_pixels
         pixel_up = -(pixel_v - CAMERA_HEIGHT / 2.0) / focal_pixels
 
+    startup_stage("lidar and depth camera set up")
     controller = DifferentialController(
         wheel_radius=0.033,
         wheel_base=0.160,
@@ -310,8 +339,10 @@ try:
             raise RuntimeError("Live preview requires an output directory; use --headless or --output-dir.")
         capture._target(preview_size)
 
+    startup_stage("video capture set up")
     for _ in range(30):
         world.step(render=not args.headless)
+    startup_stage("first 30 simulation steps")
     if preview is not None:
         preview.state.set_status("running")
 
@@ -339,6 +370,8 @@ try:
         except (AttributeError, TypeError, ValueError, IndexError):
             return None
 
+    latest_depth = None   # last depth image (m), kept for the dashboard
+
     def camera_obstacle_points(robot_height):
         """Robot-frame (x, y) of obstacles in the depth image: nearest per 2 degrees.
 
@@ -352,6 +385,8 @@ try:
         if depth.size != CAMERA_WIDTH * CAMERA_HEIGHT:
             return None
         depth = depth.reshape(CAMERA_HEIGHT, CAMERA_WIDTH)
+        global latest_depth
+        latest_depth = depth
         valid = np.isfinite(depth) & (depth > 0.02) & (depth < CAMERA_RANGE + 1.0)
         if not np.any(valid):
             return np.zeros((0, 2))
@@ -373,6 +408,72 @@ try:
         first[1:] = bins[order][1:] != bins[order][:-1]
         keep = order[first]
         return np.stack([x[keep], y[keep]], axis=1)
+
+    def publish_onboard_frame():
+        """Send the robot camera's latest colour frame to the dashboard inset."""
+        try:
+            frame = np.asarray(onboard_annotator.get_data())
+        except Exception:  # annotator not ready yet
+            return
+        if frame.ndim != 3 or frame.shape[0] == 0 or frame.shape[2] < 3:
+            return
+        from PIL import Image
+        image = Image.fromarray(np.ascontiguousarray(frame[..., :3]).astype(np.uint8), mode="RGB")
+        image = image.resize((CAMERA_WIDTH * 2, CAMERA_HEIGHT * 2), Image.BILINEAR)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=80)
+        preview.state.publish_onboard(buffer.getvalue())
+
+    def depth_to_jpeg(depth, robot_height):
+        """Colour a depth image: red/yellow = near, blue = far, black = nothing.
+
+        Pixels the navigator treats as obstacles are drawn at full brightness;
+        floor pixels are dimmed, so the image shows what the camera detects.
+        """
+        from PIL import Image
+        valid = np.isfinite(depth) & (depth > 0.02) & (depth < CAMERA_RANGE + 1.0)
+        near = np.clip(1.0 - np.where(valid, depth, CAMERA_RANGE) / CAMERA_RANGE, 0.0, 1.0)
+        stops = np.array([0.0, 0.35, 0.65, 0.85, 1.0])
+        colours = np.array([[10, 20, 60], [30, 90, 200], [40, 200, 200], [250, 220, 60], [235, 60, 40]], float)
+        rgb = np.stack([np.interp(near, stops, colours[:, c]) for c in range(3)], axis=-1)
+        forward = np.where(valid, depth, 0.0)
+        height = (robot_height + CAMERA_MOUNT[2] - forward * math.sin(CAMERA_PITCH)
+                  + pixel_up * forward * math.cos(CAMERA_PITCH))
+        floor = valid & (height <= OBSTACLE_MIN_HEIGHT)
+        rgb[floor] *= 0.3
+        rgb[~valid] = 0.0
+        image = Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+        image = image.resize((CAMERA_WIDTH * 2, CAMERA_HEIGHT * 2), Image.NEAREST)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+        return buffer.getvalue()
+
+    def publish_sensor_data(goal_distance, goal_bearing, command, robot_height):
+        """Send live sensor readings to the dashboard's Sensors panel."""
+        def nearest(points):
+            return round(float(np.min(np.hypot(points[:, 0], points[:, 1]))), 3) if len(points) else None
+
+        lidar = last_lidar_points if last_lidar_points is not None else np.zeros((0, 2))
+        camera = camera_points if camera_points is not None else np.zeros((0, 2))
+        preview.state.update_sensors({
+            "range": SCAN_MAX_RANGE,
+            "lidar": np.round(lidar, 3).tolist(),
+            "camera": np.round(camera, 3).tolist(),
+            "lidar_rays": SCAN_RAY_COUNT,
+            "lidar_nearest": nearest(lidar),
+            "camera_nearest": nearest(camera),
+            "camera_enabled": camera_annotator is not None,
+            "camera_frames": camera_frames,
+            "goal_distance": round(goal_distance, 3),
+            "goal_bearing": round(goal_bearing, 4),
+            "heading": round(nav.heading, 4) if nav is not None else None,
+            "clearance": round(nav.clearance, 3) if nav is not None else None,
+            "linear": round(float(command[0]), 3),
+            "angular": round(float(command[1]), 3),
+            "mode": nav.mode if nav is not None else None,
+        })
+        if latest_depth is not None:
+            preview.state.publish_depth(depth_to_jpeg(latest_depth, robot_height))
 
     def front_distance(points, half_angle=math.radians(10.0)):
         if points is None or not len(points):
@@ -401,6 +502,7 @@ try:
     camera_frames = 0
     camera_only_steps = 0
     nav = None
+    last_lidar_points = np.zeros((0, 2))
     completed = False
     step_limit = args.max_steps or 7200
     final_position = [START[0], START[1], 0.0]
@@ -473,6 +575,7 @@ try:
                 command = [0.0, 0.0]
             else:
                 scan, _hit_mask, lidar_points = sensor_data
+                last_lidar_points = lidar_points
                 sensor_failure_steps = 0
                 if camera_points is not None and len(camera_points):
                     points = np.vstack([lidar_points, camera_points])
@@ -562,6 +665,9 @@ try:
                 jpeg_buffer = io.BytesIO()
                 Image.fromarray(rgb, mode="RGB").save(jpeg_buffer, format="JPEG", quality=78)
                 preview.state.publish(jpeg_buffer.getvalue())
+                if onboard_annotator is not None:
+                    publish_onboard_frame()
+                publish_sensor_data(goal_distance, goal_bearing, command, final_position[2])
         if completed and step >= args.goal_hold_steps:
             break
 
